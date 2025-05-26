@@ -6,19 +6,15 @@ const path = require('path');
 
 const DatabaseManager = require('./utils/database');
 const MultiSourceTokenScanner = require('./collectors/multi_source_token_scanner');
-const SocialMonitor = require('./collectors/social_monitor'); // This now includes rate limiting
+const SocialMonitor = require('./collectors/social_monitor');
 const InfluencerTracker = require('./collectors/influencer_tracker');
 const TradingEngine = require('./executors/trading_engine');
 const logger = require('./utils/logger');
-const RateLimiter = require('./utils/rateLimiter');
 
 class MemecoinTradingBot {
     constructor() {
         this.app = express();
         this.db = new DatabaseManager();
-        this.rateLimiter = new RateLimiter();
-        this.startTime = Date.now();
-        this.errorLog = [];
         
         // Initialize trading engine first
         this.tradingEngine = new TradingEngine(this.db);
@@ -26,7 +22,7 @@ class MemecoinTradingBot {
         // Initialize components with new multi-source scanner
         this.components = {
             scanner: new MultiSourceTokenScanner(this.db),
-            social: new SocialMonitor(this.db), // Updated version with rate limiting
+            social: new SocialMonitor(this.db),
             influencer: new InfluencerTracker(this.db, this.tradingEngine),
             trading: this.tradingEngine
         };
@@ -34,6 +30,7 @@ class MemecoinTradingBot {
         this.isRunning = false;
         this.setupExpress();
         this.setupRoutes();
+        this.setupScannerListeners();
     }
 
     setupExpress() {
@@ -45,6 +42,19 @@ class MemecoinTradingBot {
         if (process.env.NODE_ENV === 'production') {
             this.app.use(express.static(path.join(__dirname, '../../frontend/build')));
         }
+    }
+
+    setupScannerListeners() {
+        // Listen for high-priority tokens
+        this.components.scanner.on('high-priority', (token) => {
+            logger.info(`🚨 HIGH PRIORITY TOKEN: ${token.symbol} from ${token.source}`);
+            // Could trigger immediate analysis or notification here
+        });
+
+        // Listen for any new token
+        this.components.scanner.on('token', (token) => {
+            logger.debug(`New token from ${token.source}: ${token.symbol}`);
+        });
     }
 
     setupRoutes() {
@@ -62,86 +72,41 @@ class MemecoinTradingBot {
                 },
                 features: {
                     multiSourceScanning: true,
+                    sources: Object.keys(this.components.scanner.scannerConfigs || {}),
                     raydiumMonitoring: !!process.env.HELIUS_API_KEY,
                     twitterTracking: !!process.env.TWITTER_BEARER_TOKEN,
-                    birdeyeIntegration: !!process.env.BIRDEYE_API_KEY,
-                    rateLimiting: true
+                    birdeyeIntegration: !!process.env.BIRDEYE_API_KEY
                 },
-                version: '2.1.0'
+                version: '3.0.0'
             });
         });
 
-        // Scanner performance endpoints
+        // Scanner status endpoint
         this.app.get('/api/scanners/status', (req, res) => {
-            const scannerStatus = {};
-            
-            if (this.components.scanner.scanners) {
-                for (const [name, scanner] of Object.entries(this.components.scanner.scanners)) {
-                    scannerStatus[name] = {
-                        enabled: scanner.config?.enabled || false,
-                        running: scanner.isRunning || false,
-                        tokensFound: scanner.tokens?.size || 0,
-                        lastUpdate: scanner.lastFetch || null,
-                        errors: scanner.errorCount || 0
-                    };
-                }
-            }
-            
-            res.json(scannerStatus);
+            const status = this.components.scanner.getScannerStatus();
+            res.json(status);
         });
 
-        this.app.get('/api/scanners/performance', (req, res) => {
-            const uptime = Date.now() - this.startTime;
-            const stats = this.components.scanner.getStatistics ? 
-                this.components.scanner.getStatistics() : {};
-            
-            const discoveryRates = {};
-            const responseTimes = {};
-            
-            if (this.components.scanner.scanners) {
-                for (const [name, scanner] of Object.entries(this.components.scanner.scanners)) {
-                    // Calculate discovery rate (tokens per minute)
-                    const runtime = (Date.now() - (scanner.startTime || this.startTime)) / 60000;
-                    discoveryRates[name] = runtime > 0 ? 
-                        (scanner.tokens?.size || 0) / runtime : 0;
-                    
-                    // Get average response time
-                    responseTimes[name] = scanner.avgResponseTime || 0;
-                }
+        // Top movers across all sources
+        this.app.get('/api/tokens/movers', async (req, res) => {
+            try {
+                const movers = await this.components.scanner.getTopMovers(20);
+                res.json(movers);
+            } catch (error) {
+                res.status(500).json({ error: error.message });
             }
+        });
+
+        // Rate limit status
+        this.app.get('/api/rate-limits', (req, res) => {
+            const socialLimits = this.components.social.getRateLimitStatus ? 
+                this.components.social.getRateLimitStatus() : {};
+            const scannerLimits = this.components.scanner.rateLimits || {};
             
             res.json({
-                uptime: uptime,
-                totalTokensDiscovered: stats.totalTokensFound || 0,
-                uniqueTokens: stats.uniqueTokens || 0,
-                discoveryRates: discoveryRates,
-                responseTimes: responseTimes,
-                errorRate: this.calculateErrorRate(),
-                totalErrors: this.errorLog.length
+                social: socialLimits,
+                scanners: scannerLimits
             });
-        });
-
-        this.app.get('/api/scanners/rate-limits', (req, res) => {
-            const limits = {};
-            
-            ['reddit', 'twitter', 'dexscreener', 'birdeye', 'moonshot'].forEach(api => {
-                const remaining = this.rateLimiter.getRemainingCalls(api);
-                const limit = this.rateLimiter.limits[api];
-                
-                if (limit) {
-                    limits[api] = {
-                        limit: limit.calls,
-                        remaining: remaining || limit.calls,
-                        resetIn: limit.window / 1000 // Convert to seconds
-                    };
-                }
-            });
-            
-            res.json(limits);
-        });
-
-        this.app.get('/api/scanners/errors', (req, res) => {
-            res.json(this.errorLog.slice(-50)); // Last 50 errors
         });
 
         // Get discovered tokens
@@ -262,7 +227,6 @@ class MemecoinTradingBot {
         // Get influencer activity
         this.app.get('/api/influencers', (req, res) => {
             try {
-                // Get recent influencer calls
                 const stmt = this.db.db.prepare(`
                     SELECT * FROM influencer_calls
                     ORDER BY timestamp DESC
@@ -281,7 +245,6 @@ class MemecoinTradingBot {
                     )
                 });
             } catch (error) {
-                // Table might not exist yet
                 res.json({ recent_calls: [], tracked_influencers: [] });
             }
         });
@@ -320,9 +283,9 @@ class MemecoinTradingBot {
             
             switch(feature) {
                 case 'influencer':
-                    if (enabled) {
+                    if (enabled && this.components.influencer) {
                         this.components.influencer.startTracking();
-                    } else {
+                    } else if (this.components.influencer) {
                         this.components.influencer.stopTracking();
                     }
                     break;
@@ -336,6 +299,18 @@ class MemecoinTradingBot {
             }
             
             res.json({ message: `Feature ${feature} ${enabled ? 'enabled' : 'disabled'}` });
+        });
+
+        // Toggle specific scanner sources
+        this.app.post('/api/scanners/toggle', (req, res) => {
+            const { source, enabled } = req.body;
+            
+            if (this.components.scanner.scannerConfigs[source]) {
+                this.components.scanner.scannerConfigs[source].enabled = enabled;
+                res.json({ message: `Scanner ${source} ${enabled ? 'enabled' : 'disabled'}` });
+            } else {
+                res.status(400).json({ error: 'Invalid scanner source' });
+            }
         });
 
         // Serve React app for all other routes in production
@@ -352,7 +327,7 @@ class MemecoinTradingBot {
             return;
         }
 
-        logger.info('🚀 Starting Solana Memecoin Trading Bot v2.1...');
+        logger.info('🚀 Starting Solana Memecoin Trading Bot v3.0 with Multi-Source Scanner...');
         logger.info(`Mode: ${process.env.PAPER_TRADING === 'true' ? 'PAPER TRADING' : 'LIVE TRADING'}`);
 
         try {
@@ -370,11 +345,15 @@ class MemecoinTradingBot {
             logger.info('✅ All components started successfully');
             
             // Log feature status
+            const scannerStatus = this.components.scanner.getScannerStatus();
+            logger.info('Scanner sources active:', Object.keys(scannerStatus).filter(s => scannerStatus[s].running));
+            
             logger.info('Features enabled:', {
                 multiSourceScanning: true,
-                rateLimiting: true,
-                enhancedSocialMonitoring: true,
-                performanceTracking: true
+                activeScanners: Object.keys(scannerStatus).filter(s => scannerStatus[s].enabled).length,
+                influencerTracking: this.components.influencer.isTracking,
+                socialMonitoring: this.components.social.isMonitoring,
+                rateLimiting: true
             });
             
         } catch (error) {
@@ -391,33 +370,13 @@ class MemecoinTradingBot {
         this.components.scanner.stopScanning();
         this.components.social.stopMonitoring();
         this.components.trading.stopTrading();
-        this.components.influencer.stopTracking();
+        
+        if (this.components.influencer) {
+            this.components.influencer.stopTracking();
+        }
         
         this.isRunning = false;
         logger.info('✅ Bot stopped');
-    }
-
-    logError(scanner, error) {
-        this.errorLog.push({
-            timestamp: Date.now(),
-            scanner: scanner,
-            message: error.message,
-            resolved: false
-        });
-        
-        // Keep only last 100 errors
-        if (this.errorLog.length > 100) {
-            this.errorLog = this.errorLog.slice(-100);
-        }
-    }
-
-    calculateErrorRate() {
-        const recentErrors = this.errorLog.filter(
-            e => Date.now() - e.timestamp < 3600000 // Last hour
-        );
-        
-        const totalRequests = 100; // Estimate
-        return (recentErrors.length / totalRequests) * 100;
     }
 
     async run() {

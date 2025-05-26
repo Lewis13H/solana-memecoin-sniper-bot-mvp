@@ -1,10 +1,8 @@
 // backend/src/collectors/multi_source_token_scanner.js
-const { Connection, PublicKey, clusterApiUrl } = require('@solana/web3.js');
+const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
-const WebSocket = require('ws');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
-const config = require('../config/scanner-sources');
 
 class MultiSourceTokenScanner extends EventEmitter {
     constructor(database) {
@@ -13,195 +11,545 @@ class MultiSourceTokenScanner extends EventEmitter {
         this.connection = new Connection(
             process.env.HELIUS_API_KEY 
                 ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`
-                : process.env.SOLANA_RPC_URL || clusterApiUrl('mainnet-beta')
+                : process.env.SOLANA_RPC_URL
         );
         
         this.isScanning = false;
-        this.scanInterval = 15000; // 15 seconds
+        this.scanInterval = 10000; // 10 seconds for multi-source
         this.processedTokens = new Set();
-        this.scanners = new Map();
         
-        // Pass configuration to scanners
-        this.scannerConfig = config;
+        // Scanner instances will be initialized in setupScanners
+        this.scanners = {};
         
-        // Initialize individual scanners
-        this.initializeScanners();
+        // Priority configuration
+        this.sourcePriority = {
+            'pumpfun': 10,
+            'moonshot': 9,
+            'raydium': 8,
+            'orca': 7,
+            'dexscreener': 6,
+            'birdeye': 5
+        };
+        
+        // Rate limiting per source
+        this.rateLimits = {
+            'pumpfun': { max: 30, window: 60000, current: 0, reset: Date.now() + 60000 },
+            'moonshot': { max: 60, window: 60000, current: 0, reset: Date.now() + 60000 },
+            'dexscreener': { max: 120, window: 60000, current: 0, reset: Date.now() + 60000 },
+            'birdeye': { max: 100, window: 60000, current: 0, reset: Date.now() + 60000 }
+        };
+        
+        this.setupScanners();
     }
 
-    initializeScanners() {
-        // Only initialize enabled scanners
-        if (config.scanners.pumpfun.enabled) {
-            this.scanners.set('pumpfun', new PumpFunScanner(this.scannerConfig));
-        }
-        
-        if (config.scanners.moonshot.enabled) {
-            this.scanners.set('moonshot', new MoonshotScanner(this.scannerConfig));
-        }
-        
-        if (config.scanners.raydium.enabled) {
-            this.scanners.set('raydium', new RaydiumScanner(this.scannerConfig, this.connection));
-        }
-        
-        if (config.scanners.dexscreener.enabled) {
-            this.scanners.set('dexscreener', new DexScreenerScanner(this.scannerConfig));
-        }
-        
-        if (config.scanners.birdeye.enabled && process.env.BIRDEYE_API_KEY) {
-            this.scanners.set('birdeye', new BirdeyeScanner(this.scannerConfig));
-        }
-
-        // Listen to token events from all scanners
-        for (const [name, scanner] of this.scanners) {
-            scanner.on('token', async (token) => {
-                await this.handleNewToken(token, name);
-            });
-            
-            scanner.on('error', (error) => {
-                logger.error(`${name} scanner error:`, error);
-            });
-        }
+    setupScanners() {
+        // Initialize scanner configurations
+        this.scannerConfigs = {
+            pumpfun: {
+                enabled: true,
+                url: 'https://api.pump.fun/tokens',
+                wsUrl: 'wss://api.pump.fun/v1/stream',
+                scanInterval: 5000
+            },
+            moonshot: {
+                enabled: true,
+                url: 'https://api.moonshot.cc/tokens/v1/solana/new',
+                scanInterval: 10000
+            },
+            dexscreener: {
+                enabled: true,
+                url: 'https://api.dexscreener.com/latest/dex/search',
+                scanInterval: 15000
+            },
+            birdeye: {
+                enabled: !!process.env.BIRDEYE_API_KEY,
+                url: 'https://public-api.birdeye.so/defi/tokenlist',
+                scanInterval: 20000
+            }
+        };
     }
 
     async startScanning() {
         if (this.isScanning) return;
         
         this.isScanning = true;
-        logger.info('🚀 Multi-source token scanner started');
-        
-        // Start all individual scanners
-        for (const [name, scanner] of this.scanners) {
+        logger.info('🚀 Multi-Source Token Scanner started');
+
+        // Start individual source scanners
+        this.startSourceScanners();
+
+        // Main aggregation loop
+        this.scanTimer = setInterval(async () => {
             try {
-                await scanner.start();
-                logger.info(`✅ ${name} scanner started`);
+                await this.aggregateAndProcessTokens();
             } catch (error) {
-                logger.error(`Failed to start ${name} scanner:`, error);
+                logger.error('Multi-source scanner error:', error);
             }
-        }
-        
-        // Start periodic aggregation
-        this.aggregationInterval = setInterval(() => {
-            this.aggregateAndAnalyze();
         }, this.scanInterval);
     }
 
-    async handleNewToken(token, source) {
-        try {
-            // Skip if already processed
-            if (this.processedTokens.has(token.address)) {
-                return;
-            }
-            
-            // Mark as processed
-            this.processedTokens.add(token.address);
-            
-            // Enrich token data
-            const enrichedToken = await this.enrichTokenData(token, source);
-            
-            // Analyze and store
-            await this.analyzeAndStoreToken(enrichedToken);
-            
-        } catch (error) {
-            logger.error(`Error handling token from ${source}:`, error);
+    startSourceScanners() {
+        // Pump.fun scanner
+        if (this.scannerConfigs.pumpfun?.enabled && this.startPumpFunScanner) {
+            this.startPumpFunScanner();
+        }
+
+        // Moonshot scanner
+        if (this.scannerConfigs.moonshot?.enabled && this.startMoonshotScanner) {
+            this.startMoonshotScanner();
+        }
+
+        // DexScreener scanner
+        if (this.scannerConfigs.dexscreener?.enabled && this.startDexScreenerScanner) {
+            this.startDexScreenerScanner();
+        }
+
+        // Birdeye scanner
+        if (this.scannerConfigs.birdeye?.enabled && this.startBirdeyeScanner) {
+            this.startBirdeyeScanner();
         }
     }
 
-    async enrichTokenData(token, source) {
+    async checkRateLimit(source) {
+        const limit = this.rateLimits[source];
+        if (!limit) return true;
+
+        // Reset if window passed
+        if (Date.now() > limit.reset) {
+            limit.current = 0;
+            limit.reset = Date.now() + limit.window;
+        }
+
+        // Check if under limit
+        if (limit.current >= limit.max) {
+            logger.warn(`Rate limit reached for ${source}: ${limit.current}/${limit.max}`);
+            return false;
+        }
+
+        limit.current++;
+        return true;
+    }
+
+    // Pump.fun Scanner
+    async startPumpFunScanner() {
+        const scanner = {
+            name: 'pumpfun',
+            tokens: new Map(),
+            lastFetch: null,
+            isRunning: true
+        };
+        
+        this.scanners.pumpfun = scanner;
+
+        // Polling
+        const scan = async () => {
+            if (!scanner.isRunning || !await this.checkRateLimit('pumpfun')) return;
+
+            try {
+                const response = await axios.get(this.scannerConfigs.pumpfun.url, {
+                    timeout: 5000,
+                    params: { 
+                        limit: 50,
+                        sort: 'created',
+                        order: 'desc'
+                    }
+                });
+
+                const tokens = response.data?.tokens || [];
+                
+                for (const token of tokens) {
+                    const processed = this.processPumpFunToken(token);
+                    if (processed && !this.processedTokens.has(processed.address)) {
+                        scanner.tokens.set(processed.address, processed);
+                        this.emit('token', processed);
+                    }
+                }
+
+                scanner.lastFetch = Date.now();
+                logger.debug(`Pump.fun: Found ${tokens.length} tokens`);
+
+            } catch (error) {
+                logger.error('Pump.fun scanner error:', error.message);
+            }
+        };
+
+        // Initial scan
+        await scan();
+        
+        // Schedule periodic scans
+        scanner.interval = setInterval(scan, this.scannerConfigs.pumpfun.scanInterval);
+
+        // WebSocket for real-time updates
+        this.connectPumpFunWebSocket();
+    }
+
+    connectPumpFunWebSocket() {
         try {
-            // Add source and discovery time
-            const enriched = {
-                ...token,
-                source: source,
-                discoveredAt: Date.now(),
-                priority: config.scanners[source]?.priority || 0
-            };
-            
-            // Get additional data if missing
-            if (!enriched.price || !enriched.marketCap) {
-                const priceData = await this.fetchTokenPrice(token.address);
-                if (priceData) {
-                    enriched.price = priceData.price;
-                    enriched.marketCap = priceData.marketCap;
+            const WebSocket = require('ws');
+            const ws = new WebSocket(this.scannerConfigs.pumpfun.wsUrl);
+
+            ws.on('open', () => {
+                logger.info('Connected to Pump.fun WebSocket');
+                ws.send(JSON.stringify({ 
+                    type: 'subscribe', 
+                    channel: 'new_tokens' 
+                }));
+            });
+
+            ws.on('message', (data) => {
+                try {
+                    const message = JSON.parse(data);
+                    if (message.type === 'new_token') {
+                        const processed = this.processPumpFunToken(message.token);
+                        if (processed && !this.processedTokens.has(processed.address)) {
+                            this.scanners.pumpfun.tokens.set(processed.address, processed);
+                            this.emit('token', processed);
+                            logger.info(`🔥 Real-time Pump.fun token: ${processed.symbol}`);
+                        }
+                    }
+                } catch (error) {
+                    logger.error('Pump.fun WS message error:', error);
+                }
+            });
+
+            ws.on('error', (error) => {
+                logger.error('Pump.fun WebSocket error:', error);
+            });
+
+            ws.on('close', () => {
+                logger.info('Pump.fun WebSocket closed, reconnecting...');
+                setTimeout(() => this.connectPumpFunWebSocket(), 5000);
+            });
+
+        } catch (error) {
+            logger.error('Failed to connect Pump.fun WebSocket:', error);
+        }
+    }
+
+    processPumpFunToken(token) {
+        if (!token || !token.mint) return null;
+
+        return {
+            address: token.mint,
+            symbol: token.symbol || 'UNKNOWN',
+            name: token.name || 'Unknown Token',
+            price: parseFloat(token.price || 0),
+            liquidity: parseFloat(token.liquidity || 0),
+            volume24h: parseFloat(token.volume_24h || 0),
+            priceChange24h: parseFloat(token.price_change_24h || 0),
+            marketCap: parseFloat(token.market_cap || 0),
+            holders: parseInt(token.holders || 0),
+            createdAt: token.created_at ? new Date(token.created_at).getTime() : Date.now(),
+            source: 'pumpfun',
+            priority: this.sourcePriority.pumpfun,
+            metadata: {
+                twitter: token.twitter,
+                telegram: token.telegram,
+                website: token.website
+            }
+        };
+    }
+
+    // Moonshot Scanner
+    async startMoonshotScanner() {
+        const scanner = {
+            name: 'moonshot',
+            tokens: new Map(),
+            lastFetch: null,
+            isRunning: true
+        };
+        
+        this.scanners.moonshot = scanner;
+
+        const scan = async () => {
+            if (!scanner.isRunning || !await this.checkRateLimit('moonshot')) return;
+
+            try {
+                const response = await axios.get(this.scannerConfigs.moonshot.url, {
+                    timeout: 5000,
+                    headers: {
+                        'Accept': 'application/json',
+                        'User-Agent': 'MemecoinBot/1.0'
+                    }
+                });
+
+                const tokens = response.data?.tokens || [];
+                
+                for (const token of tokens) {
+                    const processed = this.processMoonshotToken(token);
+                    if (processed && !this.processedTokens.has(processed.address)) {
+                        scanner.tokens.set(processed.address, processed);
+                        this.emit('token', processed);
+                    }
+                }
+
+                scanner.lastFetch = Date.now();
+                logger.debug(`Moonshot: Found ${tokens.length} tokens`);
+
+            } catch (error) {
+                logger.error('Moonshot scanner error:', error.message);
+            }
+        };
+
+        await scan();
+        scanner.interval = setInterval(scan, this.scannerConfigs.moonshot.scanInterval);
+    }
+
+    processMoonshotToken(token) {
+        if (!token || !token.address) return null;
+
+        return {
+            address: token.address,
+            symbol: token.symbol || 'UNKNOWN',
+            name: token.name || 'Unknown Token',
+            price: parseFloat(token.price || 0),
+            liquidity: parseFloat(token.liquidity || 0),
+            volume24h: parseFloat(token.volume || 0),
+            priceChange24h: parseFloat(token.change_24h || 0),
+            marketCap: parseFloat(token.market_cap || 0),
+            holders: parseInt(token.holder_count || 0),
+            createdAt: token.launch_date ? new Date(token.launch_date).getTime() : Date.now(),
+            source: 'moonshot',
+            priority: this.sourcePriority.moonshot,
+            metadata: {
+                progress: token.progress,
+                stage: token.stage
+            }
+        };
+    }
+
+    // DexScreener Scanner (existing but enhanced)
+    async startDexScreenerScanner() {
+        const scanner = {
+            name: 'dexscreener',
+            tokens: new Map(),
+            lastFetch: null,
+            isRunning: true
+        };
+        
+        this.scanners.dexscreener = scanner;
+
+        const scan = async () => {
+            if (!scanner.isRunning || !await this.checkRateLimit('dexscreener')) return;
+
+            try {
+                const response = await axios.get(this.scannerConfigs.dexscreener.url, {
+                    params: { q: 'SOL' },
+                    timeout: 10000
+                });
+
+                if (response.data?.pairs) {
+                    const tokens = response.data.pairs
+                        .filter(pair => {
+                            if (!pair || !pair.baseToken) return false;
+                            const age = pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : Infinity;
+                            return pair.chainId === 'solana' && age < 24 * 60 * 60 * 1000;
+                        })
+                        .map(pair => this.processDexScreenerToken(pair))
+                        .filter(token => token && !this.processedTokens.has(token.address));
+
+                    for (const token of tokens) {
+                        scanner.tokens.set(token.address, token);
+                        this.emit('token', token);
+                    }
+
+                    scanner.lastFetch = Date.now();
+                    logger.debug(`DexScreener: Found ${tokens.length} new tokens`);
+                }
+
+            } catch (error) {
+                logger.error('DexScreener scanner error:', error.message);
+            }
+        };
+
+        await scan();
+        scanner.interval = setInterval(scan, this.scannerConfigs.dexscreener.scanInterval);
+    }
+
+    processDexScreenerToken(pair) {
+        if (!pair || !pair.baseToken) return null;
+
+        return {
+            address: pair.baseToken.address,
+            symbol: pair.baseToken.symbol || 'UNKNOWN',
+            name: pair.baseToken.name || 'Unknown Token',
+            price: parseFloat(pair.priceUsd || 0),
+            liquidity: parseFloat(pair.liquidity?.usd || 0),
+            volume24h: parseFloat(pair.volume?.h24 || 0),
+            priceChange24h: parseFloat(pair.priceChange?.h24 || 0),
+            marketCap: parseFloat(pair.fdv || 0),
+            pairAddress: pair.pairAddress,
+            dexId: pair.dexId,
+            createdAt: pair.pairCreatedAt || Date.now(),
+            source: 'dexscreener',
+            priority: this.sourcePriority.dexscreener
+        };
+    }
+
+    // Birdeye Scanner
+    async startBirdeyeScanner() {
+        const scanner = {
+            name: 'birdeye',
+            tokens: new Map(),
+            lastFetch: null,
+            isRunning: true
+        };
+        
+        this.scanners.birdeye = scanner;
+
+        const scan = async () => {
+            if (!scanner.isRunning || !await this.checkRateLimit('birdeye')) return;
+
+            try {
+                const response = await axios.get(this.scannerConfigs.birdeye.url, {
+                    headers: { 
+                        'X-API-KEY': process.env.BIRDEYE_API_KEY,
+                        'x-chain': 'solana'
+                    },
+                    params: {
+                        sort_by: 'v24hUSD',
+                        sort_type: 'desc',
+                        limit: 50
+                    },
+                    timeout: 10000
+                });
+
+                const tokens = response.data?.data?.tokens || [];
+                
+                for (const token of tokens) {
+                    const processed = this.processBirdeyeToken(token);
+                    if (processed && !this.processedTokens.has(processed.address)) {
+                        scanner.tokens.set(processed.address, processed);
+                        this.emit('token', processed);
+                    }
+                }
+
+                scanner.lastFetch = Date.now();
+                logger.debug(`Birdeye: Found ${tokens.length} tokens`);
+
+            } catch (error) {
+                logger.error('Birdeye scanner error:', error.message);
+            }
+        };
+
+        await scan();
+        scanner.interval = setInterval(scan, this.scannerConfigs.birdeye.scanInterval || 20000);
+    }
+
+    processBirdeyeToken(token) {
+        if (!token || !token.address) return null;
+
+        const age = token.createTime ? Date.now() - (token.createTime * 1000) : Infinity;
+        if (age > 24 * 60 * 60 * 1000) return null; // Skip tokens older than 24 hours
+
+        return {
+            address: token.address,
+            symbol: token.symbol || 'UNKNOWN',
+            name: token.name || 'Unknown Token',
+            price: parseFloat(token.price || 0),
+            liquidity: parseFloat(token.liquidity || 0),
+            volume24h: parseFloat(token.v24hUSD || 0),
+            priceChange24h: parseFloat(token.v24hChangePercent || 0),
+            marketCap: parseFloat(token.mc || 0),
+            holders: parseInt(token.holder || 0),
+            createdAt: token.createTime ? token.createTime * 1000 : Date.now(),
+            source: 'birdeye',
+            priority: this.sourcePriority.birdeye || 5
+        };
+    }
+
+    // Aggregate and process tokens from all sources
+    async aggregateAndProcessTokens() {
+        const allTokens = [];
+
+        // Collect tokens from all scanners
+        for (const [source, scanner] of Object.entries(this.scanners)) {
+            if (scanner.tokens) {
+                for (const [address, token] of scanner.tokens) {
+                    if (!this.processedTokens.has(address)) {
+                        allTokens.push(token);
+                    }
                 }
             }
-            
-            return enriched;
-            
-        } catch (error) {
-            logger.error(`Error enriching token data:`, error);
-            return token;
         }
-    }
 
-    async fetchTokenPrice(tokenAddress) {
-        try {
-            // Try Jupiter first
-            const jupiterResponse = await axios.get(
-                `https://price.jup.ag/v4/price?ids=${tokenAddress}`,
-                { timeout: 5000 }
-            );
-            
-            if (jupiterResponse.data?.data?.[tokenAddress]) {
-                return {
-                    price: jupiterResponse.data.data[tokenAddress].price,
-                    marketCap: jupiterResponse.data.data[tokenAddress].marketCap?.value
-                };
+        // Sort by priority and age
+        allTokens.sort((a, b) => {
+            // First by priority
+            if (a.priority !== b.priority) {
+                return b.priority - a.priority;
             }
-            
-            // Fallback to DexScreener
-            const dexResponse = await axios.get(
-                `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`,
-                { timeout: 5000 }
-            );
-            
-            if (dexResponse.data?.pairs?.[0]) {
-                const pair = dexResponse.data.pairs[0];
-                return {
-                    price: parseFloat(pair.priceUsd),
-                    marketCap: parseFloat(pair.fdv)
-                };
-            }
-            
-            return null;
-        } catch (error) {
-            return null;
+            // Then by age (newer first)
+            return b.createdAt - a.createdAt;
+        });
+
+        // Process top tokens
+        const topTokens = allTokens.slice(0, 20);
+        
+        for (const token of topTokens) {
+            await this.analyzeAndStoreToken(token);
+            this.processedTokens.add(token.address);
+        }
+
+        // Clean up old processed tokens
+        if (this.processedTokens.size > 1000) {
+            const toRemove = Array.from(this.processedTokens).slice(0, 500);
+            toRemove.forEach(addr => this.processedTokens.delete(addr));
         }
     }
 
     async analyzeAndStoreToken(token) {
         try {
-            // Calculate scores
+            // Add source bonus to scoring
+            const sourceBonus = {
+                'pumpfun': 20,
+                'moonshot': 15,
+                'raydium': 10,
+                'dexscreener': 5,
+                'birdeye': 5
+            };
+
+            const bonus = sourceBonus[token.source] || 0;
+
             const analysis = {
-                liquidityScore: this.scoreLiquidity(token.liquidity || 0),
-                momentumScore: this.scoreMomentum(token.priceChange24h || 0, token.volume24h || 0),
-                ageScore: this.scoreAge(token.createdAt || Date.now()),
-                volumeScore: this.scoreVolume(token.volume24h || 0, token.liquidity || 1),
-                sourceScore: token.priority * 10 // Bonus for priority sources
+                liquidityScore: this.scoreLiquidity(token.liquidity),
+                momentumScore: this.scoreMomentum(token.priceChange24h || 0, token.volume24h),
+                ageScore: this.scoreAge(token.createdAt) + bonus,
+                volumeScore: this.scoreVolume(token.volume24h, token.liquidity),
+                sourceScore: bonus
             };
 
             const overallScore = (
                 analysis.liquidityScore * 0.2 +
                 analysis.momentumScore * 0.2 +
-                analysis.ageScore * 0.2 +
+                analysis.ageScore * 0.3 +
                 analysis.volumeScore * 0.2 +
-                analysis.sourceScore * 0.2
+                analysis.sourceScore * 0.1
             );
 
             const riskScore = this.calculateRiskScore(token, analysis);
 
-            // Store if meets criteria
-            if (overallScore > 25 && riskScore < 85) {
+            // Lower threshold for priority sources
+            const scoreThreshold = ['pumpfun', 'moonshot'].includes(token.source) ? 25 : 30;
+            
+            if (overallScore > scoreThreshold && riskScore < 85) {
                 await this.db.addToken({
                     address: token.address,
-                    symbol: token.symbol || 'UNKNOWN',
-                    name: token.name || 'Unknown Token',
-                    marketCap: token.marketCap || 0,
-                    liquidity: token.liquidity || 0,
+                    symbol: token.symbol,
+                    name: token.name,
+                    marketCap: token.marketCap,
+                    liquidity: token.liquidity,
                     holders: token.holders || 0,
-                    socialScore: 0,
+                    socialScore: token.source === 'pumpfun' ? 15 : 0,
                     riskScore: riskScore
                 });
 
-                logger.info(`✅ Added ${token.symbol} from ${token.source} (Score: ${overallScore.toFixed(1)}, Risk: ${riskScore.toFixed(1)})`);
+                logger.info(`✅ Added ${token.source} token: ${token.symbol} (Score: ${overallScore.toFixed(1)}, Risk: ${riskScore.toFixed(1)})`);
+                
+                // Emit high-priority alert for very new tokens
+                if (Date.now() - token.createdAt < 5 * 60 * 1000) {
+                    this.emit('high-priority', token);
+                }
             }
 
         } catch (error) {
@@ -209,6 +557,7 @@ class MultiSourceTokenScanner extends EventEmitter {
         }
     }
 
+    // Scoring methods
     scoreLiquidity(liquidity) {
         if (liquidity >= 50000) return 100;
         if (liquidity >= 25000) return 80;
@@ -268,485 +617,77 @@ class MultiSourceTokenScanner extends EventEmitter {
         if (Math.abs(token.priceChange24h || 0) > 200) risk += 20;
         else if (Math.abs(token.priceChange24h || 0) > 100) risk += 10;
         
-        const ageMinutes = (Date.now() - (token.createdAt || Date.now())) / (1000 * 60);
+        const ageMinutes = (Date.now() - token.createdAt) / (1000 * 60);
         if (ageMinutes < 10) risk += 20;
         else if (ageMinutes < 30) risk += 15;
         else if (ageMinutes < 60) risk += 10;
         
-        // Reduce risk for trusted sources
-        if (['birdeye', 'raydium'].includes(token.source)) risk -= 10;
+        // Lower risk for trusted sources
+        if (['pumpfun', 'moonshot'].includes(token.source)) risk -= 10;
+        
+        const avgScore = (analysis.liquidityScore + analysis.momentumScore + 
+                         analysis.ageScore + analysis.volumeScore) / 4;
+        if (avgScore < 40) risk += 15;
         
         return Math.min(100, Math.max(0, risk));
     }
 
-    aggregateAndAnalyze() {
-        // This method can be used to cross-reference tokens across sources
-        const tokensByAddress = new Map();
-        
-        for (const [source, scanner] of this.scanners) {
-            for (const [address, token] of scanner.tokens) {
-                if (!tokensByAddress.has(address)) {
-                    tokensByAddress.set(address, []);
-                }
-                tokensByAddress.get(address).push({ source, token });
-            }
-        }
-        
-        // Log tokens that appear in multiple sources (higher confidence)
-        for (const [address, sources] of tokensByAddress) {
-            if (sources.length > 1) {
-                const sourceNames = sources.map(s => s.source).join(', ');
-                logger.info(`🎯 Token ${sources[0].token.symbol} found on multiple sources: ${sourceNames}`);
-            }
-        }
-    }
-
+    // Get top movers across all sources
     async getTopMovers(limit = 20) {
         const allTokens = [];
-        
-        for (const [source, scanner] of this.scanners) {
-            for (const [address, token] of scanner.tokens) {
-                allTokens.push({ ...token, source });
+
+        for (const scanner of Object.values(this.scanners)) {
+            if (scanner.tokens) {
+                allTokens.push(...Array.from(scanner.tokens.values()));
             }
         }
-        
-        // Sort by score (price change * volume)
+
         return allTokens
             .sort((a, b) => {
-                const scoreA = (a.priceChange24h || 0) * (a.volume24h || 0);
-                const scoreB = (b.priceChange24h || 0) * (b.volume24h || 0);
-                return scoreB - scoreA;
+                const aScore = (a.priceChange24h || 0) * (a.volume24h || 0);
+                const bScore = (b.priceChange24h || 0) * (b.volume24h || 0);
+                return bScore - aScore;
             })
             .slice(0, limit);
+    }
+
+    // Get scanner status
+    getScannerStatus() {
+        const status = {};
+        
+        for (const [name, scanner] of Object.entries(this.scanners)) {
+            status[name] = {
+                enabled: this.scannerConfigs[name]?.enabled || false,
+                running: scanner.isRunning || false,
+                tokensFound: scanner.tokens?.size || 0,
+                lastUpdate: scanner.lastFetch || null,
+                rateLimit: this.rateLimits[name] ? {
+                    used: this.rateLimits[name].current,
+                    max: this.rateLimits[name].max,
+                    resetsIn: Math.max(0, this.rateLimits[name].reset - Date.now())
+                } : null
+            };
+        }
+        
+        return status;
     }
 
     stopScanning() {
         this.isScanning = false;
         
-        // Stop all scanners
-        for (const [name, scanner] of this.scanners) {
-            scanner.stop();
-        }
-        
-        if (this.aggregationInterval) {
-            clearInterval(this.aggregationInterval);
-        }
-        
-        logger.info('Multi-source scanner stopped');
-    }
-}
-
-// Individual Scanner Implementations
-
-class PumpFunScanner extends EventEmitter {
-    constructor(config) {
-        super();
-        this.config = config;
-        this.wsUrl = config.scanners.pumpfun.url;
-        this.ws = null;
-        this.isRunning = false;
-        this.tokens = new Map();
-        this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 10;
-    }
-
-    async start() {
-        if (this.isRunning) return;
-        this.isRunning = true;
-        this.connect();
-    }
-
-    connect() {
-        try {
-            this.ws = new WebSocket(this.wsUrl);
-            
-            this.ws.on('open', () => {
-                logger.info('Connected to Pump.fun WebSocket');
-                this.reconnectAttempts = 0;
-                
-                // Subscribe to new token events
-                this.ws.send(JSON.stringify({
-                    method: "subscribeNewToken",
-                }));
-                
-                // Subscribe to trades
-                this.ws.send(JSON.stringify({
-                    method: "subscribeTokenTrade",
-                }));
-            });
-
-            this.ws.on('message', (data) => {
-                try {
-                    const message = JSON.parse(data);
-                    this.handleMessage(message);
-                } catch (error) {
-                    logger.error('Error parsing Pump.fun message:', error);
-                }
-            });
-
-            this.ws.on('error', (error) => {
-                logger.error('Pump.fun WebSocket error:', error);
-            });
-
-            this.ws.on('close', () => {
-                logger.warn('Pump.fun WebSocket closed');
-                if (this.isRunning && this.reconnectAttempts < this.maxReconnectAttempts) {
-                    this.reconnectAttempts++;
-                    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-                    logger.info(`Reconnecting to Pump.fun in ${delay}ms...`);
-                    setTimeout(() => this.connect(), delay);
-                }
-            });
-        } catch (error) {
-            logger.error('Error connecting to Pump.fun:', error);
-        }
-    }
-
-    handleMessage(message) {
-        if (message.txType === 'create') {
-            const token = {
-                address: message.mint,
-                symbol: message.symbol,
-                name: message.name,
-                decimals: message.decimals || 6,
-                liquidity: message.vSolInBondingCurve || 0,
-                marketCap: message.marketCapSol || 0,
-                createdAt: Date.now(),
-                creator: message.traderPublicKey,
-                uri: message.uri,
-                source: 'pumpfun'
-            };
-            
-            this.tokens.set(token.address, token);
-            this.emit('token', token);
-        }
-        // Handle trade updates
-        else if (message.txType === 'buy' || message.txType === 'sell') {
-            const existingToken = this.tokens.get(message.mint);
-            if (existingToken) {
-                existingToken.volume24h = (existingToken.volume24h || 0) + (message.vSolInBondingCurve || 0);
-                existingToken.lastUpdate = Date.now();
+        // Stop all scanner intervals
+        for (const scanner of Object.values(this.scanners)) {
+            if (scanner.interval) {
+                clearInterval(scanner.interval);
             }
+            scanner.isRunning = false;
         }
-    }
-
-    stop() {
-        this.isRunning = false;
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
-    }
-}
-
-class MoonshotScanner extends EventEmitter {
-    constructor(config) {
-        super();
-        this.config = config;
-        this.programId = config.PROGRAM_IDS.MOONSHOT;
-        this.isRunning = false;
-        this.tokens = new Map();
-        this.checkInterval = 30000; // 30 seconds
-    }
-
-    async start() {
-        if (this.isRunning) return;
-        this.isRunning = true;
         
-        // Initial scan
-        await this.scanMoonshotTokens();
-        
-        // Set up periodic scanning
-        this.scanTimer = setInterval(async () => {
-            if (this.isRunning) {
-                await this.scanMoonshotTokens();
-            }
-        }, this.checkInterval);
-    }
-
-    async scanMoonshotTokens() {
-        try {
-            // Moonshot API endpoint
-            const response = await axios.get('https://api.moonshot.cc/tokens/v1/new', {
-                params: {
-                    limit: 50,
-                    offset: 0
-                },
-                timeout: 10000
-            });
-
-            if (response.data && response.data.tokens) {
-                for (const token of response.data.tokens) {
-                    const formattedToken = {
-                        address: token.mintAddress,
-                        symbol: token.symbol,
-                        name: token.name,
-                        liquidity: token.liquidity || 0,
-                        marketCap: token.marketCap || 0,
-                        volume24h: token.volume24h || 0,
-                        priceChange24h: token.priceChange24h || 0,
-                        createdAt: new Date(token.createdAt).getTime(),
-                        source: 'moonshot'
-                    };
-                    
-                    if (!this.tokens.has(formattedToken.address)) {
-                        this.tokens.set(formattedToken.address, formattedToken);
-                        this.emit('token', formattedToken);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.error('Error scanning Moonshot tokens:', error.message);
-        }
-    }
-
-    stop() {
-        this.isRunning = false;
         if (this.scanTimer) {
             clearInterval(this.scanTimer);
         }
-    }
-}
-
-class RaydiumScanner extends EventEmitter {
-    constructor(config, connection) {
-        super();
-        this.config = config;
-        this.connection = connection;
-        this.programId = new PublicKey(config.PROGRAM_IDS.RAYDIUM_V4);
-        this.isRunning = false;
-        this.tokens = new Map();
-        this.processedSignatures = new Set();
-    }
-
-    async start() {
-        if (this.isRunning) return;
-        this.isRunning = true;
         
-        // Set up real-time monitoring
-        this.subscriptionId = this.connection.onLogs(
-            this.programId,
-            async (logs, context) => {
-                if (logs.err === null) {
-                    await this.processTransaction(logs.signature);
-                }
-            },
-            'confirmed'
-        );
-        
-        // Also scan recent transactions
-        this.scanInterval = setInterval(async () => {
-            await this.scanRecentPools();
-        }, 30000);
-    }
-
-    async processTransaction(signature) {
-        if (this.processedSignatures.has(signature)) return;
-        this.processedSignatures.add(signature);
-        
-        try {
-            const tx = await this.connection.getParsedTransaction(signature, {
-                maxSupportedTransactionVersion: 0
-            });
-            
-            if (!tx || !tx.meta) return;
-            
-            // Look for pool initialization
-            const poolInfo = await this.parsePoolCreation(tx);
-            if (poolInfo) {
-                this.tokens.set(poolInfo.address, poolInfo);
-                this.emit('token', poolInfo);
-            }
-        } catch (error) {
-            // Transaction parsing errors are common, just log debug
-            logger.debug(`Error parsing Raydium transaction ${signature}:`, error.message);
-        }
-    }
-
-    async parsePoolCreation(transaction) {
-        // Implementation would parse the transaction to extract new pool/token info
-        // This is a simplified version
-        return null; // Would return token info if found
-    }
-
-    async scanRecentPools() {
-        try {
-            const signatures = await this.connection.getSignaturesForAddress(
-                this.programId,
-                { limit: 50 }
-            );
-            
-            for (const sig of signatures.slice(0, 10)) {
-                await this.processTransaction(sig.signature);
-            }
-        } catch (error) {
-            logger.error('Error scanning recent Raydium pools:', error);
-        }
-    }
-
-    stop() {
-        this.isRunning = false;
-        
-        if (this.subscriptionId) {
-            this.connection.removeOnLogsListener(this.subscriptionId);
-        }
-        
-        if (this.scanInterval) {
-            clearInterval(this.scanInterval);
-        }
-    }
-}
-
-class DexScreenerScanner extends EventEmitter {
-    constructor(config) {
-        super();
-        this.config = config;
-        this.isRunning = false;
-        this.tokens = new Map();
-        this.checkInterval = 20000; // 20 seconds
-    }
-
-    async start() {
-        if (this.isRunning) return;
-        this.isRunning = true;
-        
-        await this.scanTokens();
-        
-        this.scanTimer = setInterval(async () => {
-            if (this.isRunning) {
-                await this.scanTokens();
-            }
-        }, this.checkInterval);
-    }
-
-    async scanTokens() {
-        try {
-            const response = await axios.get(
-                'https://api.dexscreener.com/latest/dex/search',
-                { 
-                    params: { q: 'SOL' },
-                    timeout: 10000 
-                }
-            );
-
-            if (response.data && response.data.pairs) {
-                const solanaTokens = response.data.pairs
-                    .filter(pair => pair.chainId === 'solana')
-                    .slice(0, 50);
-                
-                for (const pair of solanaTokens) {
-                    if (!pair.baseToken) continue;
-                    
-                    const token = {
-                        address: pair.baseToken.address,
-                        symbol: pair.baseToken.symbol,
-                        name: pair.baseToken.name,
-                        price: parseFloat(pair.priceUsd || 0),
-                        liquidity: parseFloat(pair.liquidity?.usd || 0),
-                        volume24h: parseFloat(pair.volume?.h24 || 0),
-                        priceChange24h: parseFloat(pair.priceChange?.h24 || 0),
-                        marketCap: parseFloat(pair.fdv || 0),
-                        createdAt: pair.pairCreatedAt || Date.now(),
-                        source: 'dexscreener'
-                    };
-                    
-                    if (!this.tokens.has(token.address)) {
-                        this.tokens.set(token.address, token);
-                        this.emit('token', token);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.error('DexScreener scan error:', error.message);
-        }
-    }
-
-    stop() {
-        this.isRunning = false;
-        if (this.scanTimer) {
-            clearInterval(this.scanTimer);
-        }
-    }
-}
-
-class BirdeyeScanner extends EventEmitter {
-    constructor(config) {
-        super();
-        this.config = config;
-        this.apiKey = process.env.BIRDEYE_API_KEY;
-        this.isRunning = false;
-        this.tokens = new Map();
-        this.checkInterval = 30000; // 30 seconds
-    }
-
-    async start() {
-        if (!this.apiKey) {
-            logger.warn('Birdeye API key not configured');
-            return;
-        }
-        
-        if (this.isRunning) return;
-        this.isRunning = true;
-        
-        await this.scanTokens();
-        
-        this.scanTimer = setInterval(async () => {
-            if (this.isRunning) {
-                await this.scanTokens();
-            }
-        }, this.checkInterval);
-    }
-
-    async scanTokens() {
-        try {
-            const response = await axios.get(
-                'https://public-api.birdeye.so/defi/tokenlist',
-                {
-                    headers: { 
-                        'X-API-KEY': this.apiKey,
-                        'x-chain': 'solana'
-                    },
-                    params: {
-                        sort_by: 'v24hUSD',
-                        sort_type: 'desc',
-                        limit: 50
-                    },
-                    timeout: 10000
-                }
-            );
-
-            if (response.data && response.data.data && response.data.data.tokens) {
-                for (const token of response.data.data.tokens) {
-                    const formattedToken = {
-                        address: token.address,
-                        symbol: token.symbol,
-                        name: token.name,
-                        price: token.price,
-                        liquidity: token.liquidity,
-                        volume24h: token.v24hUSD,
-                        priceChange24h: token.v24hChangePercent,
-                        marketCap: token.mc,
-                        holders: token.holder,
-                        createdAt: token.createTime ? token.createTime * 1000 : Date.now(),
-                        source: 'birdeye'
-                    };
-                    
-                    if (!this.tokens.has(formattedToken.address)) {
-                        this.tokens.set(formattedToken.address, formattedToken);
-                        this.emit('token', formattedToken);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.error('Birdeye scan error:', error.message);
-        }
-    }
-
-    stop() {
-        this.isRunning = false;
-        if (this.scanTimer) {
-            clearInterval(this.scanTimer);
-        }
+        logger.info('Multi-source token scanner stopped');
     }
 }
 

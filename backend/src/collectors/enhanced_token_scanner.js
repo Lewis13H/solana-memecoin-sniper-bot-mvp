@@ -12,7 +12,7 @@ class EnhancedTokenScanner {
                 : process.env.SOLANA_RPC_URL
         );
         this.isScanning = false;
-        this.scanInterval = 15000; // 15 seconds for faster discovery
+        this.scanInterval = 45000; // 45 seconds for faster discovery
         this.processedTokens = new Set();
         this.processedPools = new Set();
         
