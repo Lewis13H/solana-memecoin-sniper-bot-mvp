@@ -1,0 +1,4 @@
+# Frontend specific
+node_modules/
+build/
+.env.local
