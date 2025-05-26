@@ -295,7 +295,22 @@ class MultiSourceTokenScanner extends EventEmitter {
         
         logger.info('Multi-Source Token Scanner stopped');
     }
-
+  
+    getScannerStatus() {
+        const status = {};
+        
+        for (const [name, scanner] of Object.entries(this.scanners)) {
+            status[name] = {
+                enabled: scanner.config?.enabled !== false,
+                running: scanner.isRunning || false,
+                tokensFound: scanner.tokenCount || 0,
+                lastUpdate: scanner.lastUpdate || null
+            };
+        }
+        
+        return status;
+    }
+    
     // Get scanner statistics
     getStats() {
         const stats = {};

@@ -10,6 +10,7 @@ const SocialMonitor = require('./collectors/social_monitor');
 const InfluencerTracker = require('./collectors/influencer_tracker');
 const TradingEngine = require('./executors/trading_engine');
 const logger = require('./utils/logger');
+const MultiSourceTokenScanner = require('./collectors/multi_source_token_scanner');
 
 class MemecoinTradingBot {
     constructor() {

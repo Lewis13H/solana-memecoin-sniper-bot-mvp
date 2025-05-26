@@ -152,23 +152,11 @@ class DatabaseManager {
     addToken(tokenData) {
         const stmt = this.db.prepare(`
             INSERT OR REPLACE INTO tokens 
-            (address, symbol, name, market_cap, liquidity, holders, social_score, risk_score, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (address, symbol, name, market_cap, liquidity, holders, social_score, risk_score, source, priority, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        return stmt.run(
-            tokenData.address,
-            tokenData.symbol,
-            tokenData.name,
-            tokenData.marketCap,
-            tokenData.liquidity,
-            tokenData.holders,
-            tokenData.socialScore || 0,
-            tokenData.riskScore || 0,
-            tokenData.metadata || '{}'
-        );
-    }
         
-        const metadata = tokenData.metadata ? JSON.stringify(tokenData.metadata) : null;
+        const metadata = tokenData.metadata ? JSON.stringify(tokenData.metadata) : '{}';
         
         return stmt.run(
             tokenData.address,
