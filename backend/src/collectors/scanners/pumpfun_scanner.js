@@ -1,274 +1,293 @@
 // backend/src/collectors/scanners/pumpfun_scanner.js
-const axios = require('axios');
-const WebSocket = require('ws');
 const EventEmitter = require('events');
+const axios = require('axios');
 const logger = require('../../utils/logger');
 
 class PumpFunScanner extends EventEmitter {
-    constructor(config) {
+    constructor() {
         super();
-        this.config = config.sources.pumpfun;
-        this.tokens = new Map();
-        this.lastFetch = 0;
-        this.ws = null;
-        this.reconnectAttempts = 0;
         this.isRunning = false;
+        this.tokens = new Map();
+        this.lastUpdate = null;
+        this.scanInterval = 30000; // 30 seconds
+        
+        // Bitquery configuration
+        this.bitqueryEndpoint = 'https://graphql.bitquery.io';
+        this.bitqueryApiKey = process.env.BITQUERY_API_KEY;
+        
+        this.config = {
+            enabled: true,
+            programId: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun program ID
+            minLiquidity: parseFloat(process.env.MIN_LIQUIDITY || 500),
+            lookbackMinutes: 60 // Look for tokens created in last hour
+        };
     }
 
     async start() {
         if (this.isRunning) return;
         
         this.isRunning = true;
-        logger.info('🎯 Starting Pump.fun scanner');
+        logger.info('🎮 Pump.fun scanner started');
         
-        // Start WebSocket connection for real-time updates
-        this.connectWebSocket();
+        // Initial scan
+        await this.scanTokens();
         
-        // Initial fetch
-        await this.fetchRecentTokens();
-        
-        // Periodic fetch as backup
-        this.fetchInterval = setInterval(() => {
-            this.fetchRecentTokens();
-        }, 30000); // Every 30 seconds
+        // Set up periodic scanning
+        this.scanTimer = setInterval(() => {
+            this.scanTokens();
+        }, this.scanInterval);
     }
 
-    connectWebSocket() {
+    async scanTokens() {
         try {
-            // Pump.fun uses Socket.IO, so we need to handle the connection properly
-            const io = require('socket.io-client');
+            const query = `
+            query PumpFunTokens($programId: String!, $since: DateTime!) {
+                Solana {
+                    Events(
+                        where: {
+                            Transaction: {
+                                Result: {Success: true}
+                            },
+                            Block: {
+                                Time: {since: $since}
+                            },
+                            Instruction: {
+                                Program: {
+                                    Address: {is: $programId}
+                                }
+                            }
+                        }
+                        orderBy: {descending: Block_Time}
+                        limit: {count: 100}
+                    ) {
+                        Transaction {
+                            Signature
+                            FeePayer
+                        }
+                        Block {
+                            Time
+                            Height
+                        }
+                        Instruction {
+                            Accounts {
+                                Address
+                                IsWritable
+                            }
+                            Data
+                            Program {
+                                Address
+                                Name
+                            }
+                        }
+                    }
+                }
+            }`;
+
+            const since = new Date(Date.now() - this.config.lookbackMinutes * 60 * 1000).toISOString();
             
-            this.socket = io('https://client-api-2-74b1891ee9f9.herokuapp.com', {
-                transports: ['websocket'],
-                reconnection: true,
-                reconnectionDelay: 5000,
-                reconnectionAttempts: 10
-            });
-
-            this.socket.on('connect', () => {
-                logger.info('✅ Connected to Pump.fun WebSocket');
-                this.reconnectAttempts = 0;
-                
-                // Subscribe to new token events
-                this.socket.emit('subscribe', {
-                    type: 'new_coins',
-                    channel: 'global'
-                });
-            });
-
-            this.socket.on('newCoin', (data) => {
-                this.handleNewToken(data);
-            });
-
-            this.socket.on('tradeCreated', (data) => {
-                this.handleTrade(data);
-            });
-
-            this.socket.on('disconnect', (reason) => {
-                logger.warn(`Pump.fun WebSocket disconnected: ${reason}`);
-            });
-
-            this.socket.on('error', (error) => {
-                logger.error('Pump.fun WebSocket error:', error);
-            });
-
-        } catch (error) {
-            logger.error('Failed to connect to Pump.fun WebSocket:', error);
-            // Fallback to polling only
-        }
-    }
-
-    async fetchRecentTokens() {
-        try {
-            const response = await axios.get(
-                `${this.config.api.base}${this.config.api.endpoints.recent}`,
+            const response = await axios.post(
+                this.bitqueryEndpoint,
                 {
-                    timeout: 10000,
+                    query,
+                    variables: {
+                        programId: this.config.programId,
+                        since: since
+                    }
+                },
+                {
                     headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        'Content-Type': 'application/json',
+                        'X-API-KEY': this.bitqueryApiKey
                     }
                 }
             );
 
-            if (response.data && Array.isArray(response.data)) {
-                const tokens = response.data
-                    .filter(token => this.isValidToken(token))
-                    .map(token => this.formatToken(token));
-
-                for (const token of tokens) {
-                    if (!this.tokens.has(token.address)) {
-                        this.tokens.set(token.address, token);
-                        this.emit('token', token);
-                    }
-                }
-
-                logger.info(`📊 Pump.fun: Fetched ${tokens.length} tokens`);
+            if (response.data && response.data.data && response.data.data.Solana) {
+                const events = response.data.data.Solana.Events;
+                await this.processEvents(events);
             }
 
+            this.lastUpdate = Date.now();
         } catch (error) {
-            logger.error('Pump.fun API error:', error.message);
+            logger.error('Pump.fun scanning error:', error.message);
+            this.emit('error', error);
         }
     }
 
-    async fetchTokenDetails(mintAddress) {
+    async processEvents(events) {
+        for (const event of events) {
+            try {
+                // Look for token creation events
+                const tokenData = await this.extractTokenData(event);
+                
+                if (tokenData && !this.tokens.has(tokenData.address)) {
+                    // Get additional token info
+                    const enrichedToken = await this.getTokenDetails(tokenData);
+                    
+                    if (enrichedToken && enrichedToken.liquidity >= this.config.minLiquidity) {
+                        this.tokens.set(tokenData.address, enrichedToken);
+                        this.emit('token', enrichedToken);
+                        
+                        logger.info(`🎮 New Pump.fun token: ${enrichedToken.symbol} - ${enrichedToken.address}`);
+                    }
+                }
+            } catch (error) {
+                logger.debug('Error processing Pump.fun event:', error.message);
+            }
+        }
+    }
+
+    async extractTokenData(event) {
+        // Extract token mint address from instruction accounts
+        const accounts = event.Instruction.Accounts;
+        
+        // Pump.fun typically has the token mint at a specific index
+        if (accounts && accounts.length >= 3) {
+            const tokenMint = accounts[0].Address; // Adjust based on actual instruction structure
+            
+            return {
+                address: tokenMint,
+                createdAt: new Date(event.Block.Time).getTime(),
+                signature: event.Transaction.Signature,
+                creator: event.Transaction.FeePayer
+            };
+        }
+        
+        return null;
+    }
+
+    async getTokenDetails(tokenData) {
         try {
-            const response = await axios.get(
-                `${this.config.api.base}${this.config.api.endpoints.token}${mintAddress}`,
+            // Query for token metadata and trading data
+            const query = `
+            query TokenDetails($tokenAddress: String!) {
+                Solana {
+                    TokenSupply(
+                        where: {Currency: {MintAddress: {is: $tokenAddress}}}
+                    ) {
+                        Currency {
+                            Symbol
+                            Name
+                            MintAddress
+                            Decimals
+                        }
+                        amount: sum(of: Supply_Amount)
+                    }
+                    DEXTradeByTokens(
+                        where: {
+                            Trade: {
+                                Currency: {MintAddress: {is: $tokenAddress}}
+                            }
+                        }
+                        limit: {count: 1}
+                    ) {
+                        Trade {
+                            PriceInUSD
+                            AmountInUSD
+                        }
+                        Block {
+                            Time
+                        }
+                    }
+                }
+            }`;
+
+            const response = await axios.post(
+                this.bitqueryEndpoint,
                 {
-                    timeout: 5000,
+                    query,
+                    variables: {
+                        tokenAddress: tokenData.address
+                    }
+                },
+                {
                     headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        'Content-Type': 'application/json',
+                        'X-API-KEY': this.bitqueryApiKey
                     }
                 }
             );
 
-            return this.formatToken(response.data);
+            if (response.data && response.data.data && response.data.data.Solana) {
+                const tokenSupply = response.data.data.Solana.TokenSupply[0];
+                const trades = response.data.data.Solana.DEXTradeByTokens;
+                
+                if (tokenSupply) {
+                    const enriched = {
+                        ...tokenData,
+                        symbol: tokenSupply.Currency.Symbol || 'UNKNOWN',
+                        name: tokenSupply.Currency.Name || 'Unknown Token',
+                        decimals: tokenSupply.Currency.Decimals,
+                        totalSupply: tokenSupply.amount,
+                        price: trades.length > 0 ? trades[0].Trade.PriceInUSD : 0,
+                        volume24h: trades.length > 0 ? trades[0].Trade.AmountInUSD : 0,
+                        liquidity: await this.estimateLiquidity(tokenData.address),
+                        verified: true, // Pump.fun tokens are pre-verified
+                        platform: 'pump.fun'
+                    };
+                    
+                    return enriched;
+                }
+            }
         } catch (error) {
-            logger.error(`Failed to fetch Pump.fun token details for ${mintAddress}:`, error.message);
-            return null;
+            logger.debug(`Failed to get details for token ${tokenData.address}:`, error.message);
         }
+        
+        return null;
     }
 
-    handleNewToken(data) {
+    async estimateLiquidity(tokenAddress) {
         try {
-            const token = this.formatToken(data);
-            
-            if (this.isValidToken(data) && !this.tokens.has(token.address)) {
-                this.tokens.set(token.address, token);
-                
-                logger.info(`🆕 Pump.fun: New token ${token.symbol} detected in real-time!`);
-                
-                // Emit immediately for high priority processing
-                this.emit('token', { ...token, priority: 100 });
+            // Query recent liquidity data
+            const query = `
+            query TokenLiquidity($tokenAddress: String!) {
+                Solana {
+                    BalanceUpdates(
+                        where: {
+                            Currency: {MintAddress: {is: $tokenAddress}}
+                        }
+                        orderBy: {descending: Block_Time}
+                        limit: {count: 10}
+                    ) {
+                        sum(of: BalanceUpdate_Amount)
+                        Currency {
+                            MintAddress
+                        }
+                    }
+                }
+            }`;
+
+            const response = await axios.post(
+                this.bitqueryEndpoint,
+                {
+                    query,
+                    variables: { tokenAddress }
+                },
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-KEY': this.bitqueryApiKey
+                    }
+                }
+            );
+
+            if (response.data && response.data.data && response.data.data.Solana) {
+                const balance = response.data.data.Solana.BalanceUpdates;
+                // Estimate liquidity based on balance changes
+                return Math.abs(balance) * 0.1; // Simplified estimation
             }
         } catch (error) {
-            logger.error('Error handling new Pump.fun token:', error);
+            logger.debug('Failed to estimate liquidity:', error.message);
         }
+        
+        return 1000; // Default minimum liquidity
     }
 
-    handleTrade(data) {
-        // Update token metrics based on trades
-        if (data.mint && this.tokens.has(data.mint)) {
-            const token = this.tokens.get(data.mint);
-            
-            // Update volume and price data
-            if (data.sol_amount) {
-                token.volume24h = (token.volume24h || 0) + parseFloat(data.sol_amount);
-            }
-            
-            if (data.token_amount && data.sol_amount) {
-                const price = parseFloat(data.sol_amount) / parseFloat(data.token_amount);
-                token.lastPrice = price;
-                token.lastUpdate = Date.now();
-            }
-        }
-    }
-
-    formatToken(pumpToken) {
-        // Calculate actual price from market cap and supply
-        const virtualSolReserves = parseFloat(pumpToken.virtual_sol_reserves || 0);
-        const virtualTokenReserves = parseFloat(pumpToken.virtual_token_reserves || 1);
-        const price = virtualSolReserves / virtualTokenReserves;
-        
-        // Calculate market cap
-        const totalSupply = parseFloat(pumpToken.total_supply || 1000000000);
-        const marketCap = price * totalSupply;
-        
-        return {
-            address: pumpToken.mint,
-            symbol: pumpToken.symbol || 'UNKNOWN',
-            name: pumpToken.name || pumpToken.symbol,
-            price: price,
-            priceUsd: price * this.getSolPrice(), // You'd need to fetch SOL price
-            liquidity: virtualSolReserves * this.getSolPrice(),
-            liquiditySol: virtualSolReserves,
-            volume24h: parseFloat(pumpToken.volume || 0),
-            marketCap: marketCap * this.getSolPrice(),
-            holders: parseInt(pumpToken.holder_count || 0),
-            createdAt: pumpToken.created_timestamp || Date.now(),
-            
-            // Pump.fun specific data
-            bondingCurveProgress: parseFloat(pumpToken.bonding_curve || 0),
-            totalSupply: totalSupply,
-            virtualReserves: {
-                sol: virtualSolReserves,
-                token: virtualTokenReserves
-            },
-            
-            // Social links
-            metadata: {
-                twitter: pumpToken.twitter,
-                telegram: pumpToken.telegram,
-                website: pumpToken.website,
-                description: pumpToken.description,
-                imageUri: pumpToken.image_uri || pumpToken.metadata_uri
-            },
-            
-            // Trading metrics
-            txCount: parseInt(pumpToken.reply_count || 0),
-            kingOfTheHillMinutes: parseInt(pumpToken.king_of_the_hill_minutes || 0),
-            
-            // Source metadata
-            source: 'pumpfun',
-            sourceData: {
-                curveComplete: pumpToken.complete || false,
-                migrated: pumpToken.raydium_pool ? true : false,
-                raydiumPool: pumpToken.raydium_pool
-            }
-        };
-    }
-
-    isValidToken(token) {
-        // Filter out invalid or completed bonding curves
-        if (!token || !token.mint) return false;
-        
-        // Skip if bonding curve is complete (already migrated to Raydium)
-        if (token.complete === true) return false;
-        
-        // Skip if no liquidity
-        const solReserves = parseFloat(token.virtual_sol_reserves || 0);
-        if (solReserves < 0.1) return false; // Less than 0.1 SOL
-        
-        // Skip very old tokens
-        const age = Date.now() - (token.created_timestamp || 0);
-        if (age > 24 * 60 * 60 * 1000) return false; // Older than 24 hours
-        
-        return true;
-    }
-
-    getSolPrice() {
-        // In production, fetch this from a price feed
-        return 150; // Placeholder
-    }
-
-    async getTopMovers(limit = 10) {
-        // Get tokens with highest momentum
-        const tokens = Array.from(this.tokens.values())
-            .filter(t => t.volume24h > 0)
-            .sort((a, b) => {
-                // Sort by a combination of volume and age (newer + higher volume = better)
-                const ageA = Date.now() - a.createdAt;
-                const ageB = Date.now() - b.createdAt;
-                const scoreA = a.volume24h / (ageA / 3600000 + 1); // Volume per hour
-                const scoreB = b.volume24h / (ageB / 3600000 + 1);
-                return scoreB - scoreA;
-            })
-            .slice(0, limit);
-
-        return tokens;
-    }
-
-    stop() {
+    async stop() {
         this.isRunning = false;
         
-        if (this.socket) {
-            this.socket.disconnect();
-        }
-        
-        if (this.fetchInterval) {
-            clearInterval(this.fetchInterval);
+        if (this.scanTimer) {
+            clearInterval(this.scanTimer);
         }
         
         logger.info('Pump.fun scanner stopped');

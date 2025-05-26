@@ -10,6 +10,7 @@ const SocialMonitor = require('./collectors/social_monitor');
 const InfluencerTracker = require('./collectors/influencer_tracker');
 const TradingEngine = require('./executors/trading_engine');
 const logger = require('./utils/logger');
+const MultiSourceTokenScanner = require('./collectors/multi_source_token_scanner');
 
 class MemecoinTradingBot {
     constructor() {
@@ -83,8 +84,13 @@ class MemecoinTradingBot {
 
         // Scanner status endpoint
         this.app.get('/api/scanners/status', (req, res) => {
-            const status = this.components.scanner.getScannerStatus();
-            res.json(status);
+            try {
+                const scannerStats = this.components.scanner.getStats();
+                res.json(scannerStats);
+            } catch (error) {
+                logger.error('Error getting scanner status:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
         });
 
         // Top movers across all sources
