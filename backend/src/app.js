@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const path = require('path');
 
 const DatabaseManager = require('./utils/database');
-const MultiSourceTokenScanner = require('./collectors/multi_source_token_scanner');
+const EnhancedTokenScanner = require('./collectors/enhanced_token_scanner'); 
 const SocialMonitor = require('./collectors/social_monitor');
 const InfluencerTracker = require('./collectors/influencer_tracker');
 const TradingEngine = require('./executors/trading_engine');
@@ -21,7 +21,7 @@ class MemecoinTradingBot {
         
         // Initialize components with new multi-source scanner
         this.components = {
-            scanner: new MultiSourceTokenScanner(this.db),
+            scanner: new EnhancedTokenScanner(this.db),
             social: new SocialMonitor(this.db),
             influencer: new InfluencerTracker(this.db, this.tradingEngine),
             trading: this.tradingEngine
