@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const path = require('path');
 
 const DatabaseManager = require('./utils/database');
-const EnhancedTokenScanner = require('./collectors/enhanced_token_scanner');
+const MultiSourceTokenScanner = require('./collectors/multi_source_token_scanner');
 const SocialMonitor = require('./collectors/social_monitor');
 const InfluencerTracker = require('./collectors/influencer_tracker');
 const TradingEngine = require('./executors/trading_engine');
@@ -19,9 +19,9 @@ class MemecoinTradingBot {
         // Initialize trading engine first
         this.tradingEngine = new TradingEngine(this.db);
         
-        // Initialize components
+        // Initialize components with MultiSourceTokenScanner
         this.components = {
-            scanner: new EnhancedTokenScanner(this.db),
+            scanner: new MultiSourceTokenScanner(this.db),
             social: new SocialMonitor(this.db),
             influencer: new InfluencerTracker(this.db, this.tradingEngine),
             trading: this.tradingEngine
@@ -57,12 +57,41 @@ class MemecoinTradingBot {
                     trading: this.components.trading.isTrading
                 },
                 features: {
+                    multiSourceScanning: true,
                     raydiumMonitoring: !!process.env.HELIUS_API_KEY,
                     twitterTracking: !!process.env.TWITTER_BEARER_TOKEN,
                     birdeyeIntegration: !!process.env.BIRDEYE_API_KEY
                 },
-                version: '2.0.0'
+                version: '2.1.0'
             });
+        });
+
+        // Scanner status endpoint
+        this.app.get('/api/scanners/status', (req, res) => {
+            const scannerStatus = {};
+            
+            if (this.components.scanner.scanners) {
+                for (const [name, scanner] of this.components.scanner.scanners) {
+                    scannerStatus[name] = {
+                        enabled: true,
+                        running: scanner.isRunning || false,
+                        tokensFound: scanner.tokens?.size || 0,
+                        lastUpdate: scanner.lastFetch || null
+                    };
+                }
+            }
+            
+            res.json(scannerStatus);
+        });
+
+        // Get top movers across all sources
+        this.app.get('/api/tokens/movers', async (req, res) => {
+            try {
+                const movers = await this.components.scanner.getTopMovers(20);
+                res.json(movers);
+            } catch (error) {
+                res.status(500).json({ error: error.message });
+            }
         });
 
         // Get discovered tokens
@@ -273,7 +302,7 @@ class MemecoinTradingBot {
             return;
         }
 
-        logger.info('🚀 Starting Solana Memecoin Trading Bot v2.0...');
+        logger.info('🚀 Starting Solana Memecoin Trading Bot v2.1...');
         logger.info(`Mode: ${process.env.PAPER_TRADING === 'true' ? 'PAPER TRADING' : 'LIVE TRADING'}`);
 
         try {
@@ -292,7 +321,7 @@ class MemecoinTradingBot {
             
             // Log feature status
             logger.info('Features enabled:', {
-                enhancedScanning: true,
+                multiSourceScanning: true,
                 raydiumMonitoring: !!process.env.HELIUS_API_KEY,
                 influencerTracking: true,
                 twitterIntegration: !!process.env.TWITTER_BEARER_TOKEN,
