@@ -1,179 +1,124 @@
 // backend/src/collectors/scanners/moonshot_scanner.js
+const ScannerBase = require('../scanner_base');
 const axios = require('axios');
-const { Connection, PublicKey } = require('@solana/web3.js');
-const EventEmitter = require('events');
-const logger = require('../../utils/logger');
 
-class MoonshotScanner extends EventEmitter {
-    constructor(config, parent) {
-        super();
-        this.config = config.sources.moonshot;
-        this.parent = parent;
-        this.connection = parent.connection;
-        this.tokens = new Map();
-        this.isRunning = false;
-        this.programId = new PublicKey(this.config.programId);
-    }
-
-    async start() {
-        if (this.isRunning) return;
-        
-        this.isRunning = true;
-        logger.info('🌙 Starting Moonshot scanner');
-        
-        // Initial fetch
-        await this.fetchTokens();
-        
-        // Monitor program for new tokens
-        this.subscribeToProgram();
-        
-        // Periodic fetch
-        this.fetchInterval = setInterval(() => {
-            this.fetchTokens();
-        }, 60000); // Every minute
+class MoonshotScanner extends ScannerBase {
+    constructor(config) {
+        super('moonshot', config);
+        this.apiUrl = 'https://api.moonshot.cc/tokens/v1/solana';
+        this.lastFetch = 0;
+        this.fetchInterval = 30000; // 30 seconds
     }
 
     async fetchTokens() {
         try {
-            const response = await axios.get(
-                `${this.config.api.base}${this.config.api.endpoints.new}`,
-                {
-                    headers: {
-                        'Accept': 'application/json'
-                    },
-                    timeout: 10000
-                }
-            );
-
-            if (response.data && response.data.tokens) {
-                const tokens = response.data.tokens
-                    .filter(token => this.isValidToken(token))
-                    .map(token => this.formatToken(token));
-
-                for (const token of tokens) {
-                    if (!this.tokens.has(token.address)) {
-                        this.tokens.set(token.address, token);
-                        this.emit('token', token);
-                    }
-                }
-
-                logger.info(`🌙 Moonshot: Fetched ${tokens.length} tokens`);
+            // Check if we should fetch (rate limiting)
+            const now = Date.now();
+            if (now - this.lastFetch < this.fetchInterval) {
+                return [];
             }
-        } catch (error) {
-            logger.error('Moonshot API error:', error.message);
-        }
-    }
+            
+            this.lastFetch = now;
 
-    subscribeToProgram() {
-        // Monitor Moonshot program for new token creation
-        this.connection.onLogs(
-            this.programId,
-            async (logs) => {
-                if (logs.err) return;
-                
-                // Check for token creation event
-                if (this.isTokenCreation(logs)) {
-                    const tokenData = await this.parseTokenCreation(logs.signature);
-                    if (tokenData) {
-                        this.emit('token', { ...tokenData, priority: 95 });
-                        logger.info(`🌙 Moonshot: New token ${tokenData.symbol} detected on-chain!`);
-                    }
+            const response = await axios.get(this.apiUrl, {
+                timeout: 10000,
+                headers: {
+                    'Accept': 'application/json',
+                    'User-Agent': 'MoonshotBot/1.0'
                 }
-            },
-            'confirmed'
-        );
-    }
-
-    isTokenCreation(logs) {
-        return logs.logs.some(log => 
-            log.includes('TokenMint') || 
-            log.includes('InitializeToken') ||
-            log.includes('CreateToken')
-        );
-    }
-
-    async parseTokenCreation(signature) {
-        try {
-            const tx = await this.connection.getParsedTransaction(signature, {
-                maxSupportedTransactionVersion: 0
             });
 
-            if (!tx || !tx.meta) return null;
-
-            // Extract token mint from transaction
-            // This is simplified - actual implementation would parse the specific instruction
-            const instructions = tx.transaction.message.instructions;
-            
-            for (const ix of instructions) {
-                if (ix.programId.toString() === this.programId.toString()) {
-                    // Extract token address from instruction data
-                    // This would need proper parsing based on Moonshot's instruction format
-                    return null; // Placeholder
-                }
+            if (!response.data) {
+                this.logger.warn('Moonshot API returned no data');
+                return [];
             }
+
+            // Handle different response formats
+            let tokens = [];
+            if (Array.isArray(response.data)) {
+                tokens = response.data;
+            } else if (response.data.tokens && Array.isArray(response.data.tokens)) {
+                tokens = response.data.tokens;
+            } else if (response.data.data && Array.isArray(response.data.data)) {
+                tokens = response.data.data;
+            } else {
+                this.logger.warn('Unexpected Moonshot API response format');
+                return [];
+            }
+
+            return tokens
+                .filter(token => this.isValidToken(token))
+                .map(token => this.parseToken(token))
+                .slice(0, 50); // Limit to 50 tokens
+
         } catch (error) {
-            logger.error('Error parsing Moonshot transaction:', error);
-            return null;
+            // Don't log 404 or connection errors as errors
+            if (error.response?.status === 404) {
+                this.logger.debug('Moonshot API endpoint not found - service may be down');
+            } else if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+                this.logger.debug('Cannot connect to Moonshot API - service may be offline');
+            } else {
+                this.logger.debug(`Moonshot scanner error: ${error.message}`);
+            }
+            return [];
         }
     }
 
-    formatToken(moonshotToken) {
+    isValidToken(token) {
+        // Validate token has required fields
+        return token && 
+               (token.address || token.token_address || token.mint) &&
+               (token.symbol || token.ticker) &&
+               (token.marketCap || token.market_cap || token.fdv) > 0;
+    }
+
+    parseToken(token) {
+        // Handle different field names that Moonshot might use
+        const address = token.address || token.token_address || token.mint;
+        const symbol = token.symbol || token.ticker || 'UNKNOWN';
+        const name = token.name || token.token_name || symbol;
+        const marketCap = token.marketCap || token.market_cap || token.fdv || 0;
+        const price = token.price || token.price_usd || 0;
+        const volume = token.volume || token.volume_24h || token.volume24h || 0;
+        const liquidity = token.liquidity || token.liquidity_usd || marketCap * 0.1; // Estimate if not provided
+        
         return {
-            address: moonshotToken.mint || moonshotToken.address,
-            symbol: moonshotToken.symbol,
-            name: moonshotToken.name,
-            price: parseFloat(moonshotToken.price || 0),
-            priceUsd: parseFloat(moonshotToken.priceUsd || 0),
-            liquidity: parseFloat(moonshotToken.liquidity || 0),
-            liquiditySol: parseFloat(moonshotToken.liquiditySol || 0),
-            volume24h: parseFloat(moonshotToken.volume24h || 0),
-            marketCap: parseFloat(moonshotToken.marketCap || 0),
-            holders: parseInt(moonshotToken.holders || 0),
-            createdAt: moonshotToken.createdAt || Date.now(),
-            priceChange24h: parseFloat(moonshotToken.priceChange24h || 0),
-            
-            // Moonshot specific
-            verified: moonshotToken.verified || false,
-            migrationEligible: moonshotToken.migrationEligible || false,
-            totalSupply: parseFloat(moonshotToken.totalSupply || 0),
-            
-            metadata: {
-                description: moonshotToken.description,
-                twitter: moonshotToken.twitter,
-                telegram: moonshotToken.telegram,
-                website: moonshotToken.website,
-                logo: moonshotToken.logo
-            },
-            
+            address: address,
+            symbol: symbol.toUpperCase(),
+            name: name,
+            price: parseFloat(price),
+            marketCap: parseFloat(marketCap),
+            liquidity: parseFloat(liquidity),
+            volume24h: parseFloat(volume),
+            holders: token.holders || token.holder_count || 0,
+            createdAt: token.created_at ? new Date(token.created_at).getTime() : Date.now(),
             source: 'moonshot',
-            sourceData: {
-                dexPair: moonshotToken.dexPair,
-                poolAddress: moonshotToken.poolAddress
+            sourceUrl: `https://moonshot.cc/token/${address}`,
+            metadata: {
+                priceChange24h: token.price_change_24h || token.priceChange24h || 0,
+                totalSupply: token.total_supply || token.totalSupply || 0
             }
         };
     }
 
-    isValidToken(token) {
-        if (!token || !token.mint) return false;
-        
-        // Skip if too old
-        const age = Date.now() - (token.createdAt || 0);
-        if (age > 24 * 60 * 60 * 1000) return false;
-        
-        // Skip if no liquidity
-        if (parseFloat(token.liquidity || 0) < 100) return false;
-        
-        return true;
-    }
+    calculatePriority(token) {
+        let priority = 50; // Base priority for Moonshot tokens
 
-    stop() {
-        this.isRunning = false;
-        
-        if (this.fetchInterval) {
-            clearInterval(this.fetchInterval);
-        }
-        
-        logger.info('Moonshot scanner stopped');
+        // High market cap
+        if (token.marketCap > 1000000) priority += 20;
+        else if (token.marketCap > 100000) priority += 10;
+
+        // High volume
+        if (token.volume24h > 100000) priority += 20;
+        else if (token.volume24h > 10000) priority += 10;
+
+        // New tokens get priority
+        const ageHours = (Date.now() - token.createdAt) / (1000 * 60 * 60);
+        if (ageHours < 1) priority += 30;
+        else if (ageHours < 6) priority += 20;
+        else if (ageHours < 24) priority += 10;
+
+        return Math.min(priority, 100);
     }
 }
 
