@@ -1,13 +1,8 @@
-// frontend/src/components/Dashboard.js
 import React, { useState, useEffect } from 'react';
-import ScannerPerformanceDashboard from './ScannerPerformanceDashboard';
-
 
 const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:3000/api';
 
 const Dashboard = () => {
-    const [pumpFunTokens, setPumpFunTokens] = useState([]);
-    const [scannerStats, setScannerStats] = useState({});
     const [status, setStatus] = useState({});
     const [tokens, setTokens] = useState([]);
     const [trades, setTrades] = useState([]);
@@ -19,18 +14,15 @@ const Dashboard = () => {
     const [activeTab, setActiveTab] = useState('overview');
 
     useEffect(() => {
-        // Only fetch data when not on scanner tab
-        if (activeTab !== 'scanners') {
-            fetchData();
-            const interval = setInterval(fetchData, 15000); // Update every 15 seconds
-            return () => clearInterval(interval);
-        }
-    }, [activeTab]);
+        fetchData();
+        const interval = setInterval(fetchData, 15000); // Update every 15 seconds
+        return () => clearInterval(interval);
+    }, []);
 
     const fetchData = async () => {
         try {
             setIsLoading(true);
-            const [statusRes, tokensRes, tradesRes, portfolioRes, performanceRes, influencersRes,pumpFunRes,scannerStatsRes] = await Promise.all([
+            const [statusRes, tokensRes, tradesRes, portfolioRes, performanceRes, influencersRes] = await Promise.all([
                 fetch(`${API_BASE}/status`).then(res => res.json()),
                 fetch(`${API_BASE}/tokens?limit=20`).then(res => res.json()),
                 fetch(`${API_BASE}/trades?limit=20`).then(res => res.json()),
@@ -39,12 +31,6 @@ const Dashboard = () => {
                 fetch(`${API_BASE}/influencers`)
                     .then(res => res.json())
                     .catch(() => ({ recent_calls: [], tracked_influencers: [] }))
-                fetch(`${API_BASE}/tokens/pumpfun?limit=10`)
-                    .then(res => res.json())
-                    .catch(() => []),
-                fetch(`${API_BASE}/scanners/stats`)
-                    .then(res => res.json())
-                    .catch(() => ({}))    
             ]);
 
             setStatus(statusRes);
@@ -53,8 +39,6 @@ const Dashboard = () => {
             setPortfolio(portfolioRes);
             setPerformance(performanceRes);
             setInfluencers(influencersRes);
-            setPumpFunTokens(pumpFunRes);
-            setScannerStats(scannerStatsRes)
             setError(null);
         } catch (err) {
             console.error('Error fetching data:', err);
@@ -110,12 +94,6 @@ const Dashboard = () => {
         return <span className={color}>{value >= 0 ? '+' : ''}{value.toFixed(2)}%</span>;
     };
 
-    
-    const getTokenAgeMinutes = (discoveredAt) => {
-        const age = Date.now() - new Date(discoveredAt).getTime();
-        return Math.floor(age / (1000 * 60));
-    };
-
     const getTokenAge = (discoveredAt) => {
         const age = Date.now() - new Date(discoveredAt).getTime();
         const hours = Math.floor(age / (1000 * 60 * 60));
@@ -146,70 +124,6 @@ const Dashboard = () => {
         );
     }
 
-    // Show Scanner Performance Dashboard when on scanners tab
-    if (activeTab === 'scanners') {
-        return (
-            <div className="min-h-screen bg-gray-50">
-                {/* Header */}
-                <header className="mb-6">
-                    <div className="bg-white rounded-lg shadow p-6">
-                        <div className="flex justify-between items-center">
-                            <div>
-                                <h1 className="text-3xl font-bold text-gray-800">Solana Memecoin Trading Bot v2.1</h1>
-                                <p className="text-gray-600 mt-1">Multi-Source Scanner with Rate Limiting</p>
-                            </div>
-                            <div className="flex items-center gap-4">
-                                <span className={`px-3 py-1 rounded-full text-sm font-medium ${
-                                    status.status === 'running' 
-                                        ? 'bg-green-100 text-green-800' 
-                                        : 'bg-red-100 text-red-800'
-                                }`}>
-                                    {status.status === 'running' ? '● Running' : '○ Stopped'}
-                                </span>
-                                {status.status === 'running' ? (
-                                    <button 
-                                        onClick={handleStop}
-                                        className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
-                                    >
-                                        Stop Bot
-                                    </button>
-                                ) : (
-                                    <button 
-                                        onClick={handleStart}
-                                        className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
-                                    >
-                                        Start Bot
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                </header>
-
-                {/* Navigation Tabs */}
-                <div className="mb-6">
-                    <nav className="flex space-x-4">
-                        {['overview', 'tokens', 'pumpfun', 'trades', 'influencers', 'performance', 'scanners'].map(tab => (
-                            <button
-                                key={tab}
-                                onClick={() => setActiveTab(tab)}
-                                className={`px-4 py-2 rounded-lg font-medium ${
-                                    activeTab === tab 
-                                        ? 'bg-blue-500 text-white' 
-                                        : 'bg-white text-gray-700 hover:bg-gray-100'
-                                }`}
-                            >
-                                {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                            </button>
-                        ))}
-                    </nav>
-                </div>
-
-                <ScannerPerformanceDashboard />
-            </div>
-        );
-    }
-
     return (
         <div className="min-h-screen bg-gray-50 p-4">
             {/* Header */}
@@ -217,8 +131,8 @@ const Dashboard = () => {
                 <div className="bg-white rounded-lg shadow p-6">
                     <div className="flex justify-between items-center">
                         <div>
-                            <h1 className="text-3xl font-bold text-gray-800">Solana Memecoin Trading Bot v2.1</h1>
-                            <p className="text-gray-600 mt-1">Multi-Source Scanner with Rate Limiting</p>
+                            <h1 className="text-3xl font-bold text-gray-800">Solana Memecoin Trading Bot v2.0</h1>
+                            <p className="text-gray-600 mt-1">Enhanced with Raydium Monitoring & Influencer Tracking</p>
                         </div>
                         <div className="flex items-center gap-4">
                             <span className={`px-3 py-1 rounded-full text-sm font-medium ${
@@ -296,7 +210,7 @@ const Dashboard = () => {
             {/* Navigation Tabs */}
             <div className="mb-6">
                 <nav className="flex space-x-4">
-                    {['overview', 'tokens', 'pumpfun', 'trades', 'influencers', 'performance', 'scanners'].map(tab => (
+                    {['overview', 'tokens', 'trades', 'influencers', 'performance'].map(tab => (
                         <button
                             key={tab}
                             onClick={() => setActiveTab(tab)}
@@ -312,7 +226,7 @@ const Dashboard = () => {
                 </nav>
             </div>
 
-            {/* Tab Content - Rest of the original dashboard content */}
+            {/* Tab Content */}
             {activeTab === 'overview' && (
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                     {/* Portfolio Summary */}
@@ -362,7 +276,6 @@ const Dashboard = () => {
                 </div>
             )}
 
-            {/* ... rest of the tab content remains the same ... */}
             {activeTab === 'tokens' && (
                 <div className="bg-white rounded-lg shadow overflow-hidden">
                     <table className="min-w-full divide-y divide-gray-200">
@@ -374,7 +287,6 @@ const Dashboard = () => {
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Social Score</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Risk Score</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Age</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Source</th>
                             </tr>
                         </thead>
                         <tbody className="bg-white divide-y divide-gray-200">
@@ -421,16 +333,61 @@ const Dashboard = () => {
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                                         {getTokenAge(token.discovered_at)}
                                     </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+
+            {activeTab === 'trades' && (
+                <div className="bg-white rounded-lg shadow overflow-hidden">
+                    <table className="min-w-full divide-y divide-gray-200">
+                        <thead className="bg-gray-50">
+                            <tr>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Token</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Side</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount (SOL)</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                            {trades.map((trade) => (
+                                <tr key={trade.id} className="hover:bg-gray-50">
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                        {new Date(trade.created_at).toLocaleTimeString()}
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                                        {trade.symbol || trade.token_address.substring(0, 8) + '...'}
+                                    </td>
                                     <td className="px-6 py-4 whitespace-nowrap">
                                         <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                                            token.source === 'pumpfun' ? 'bg-purple-100 text-purple-800' :
-                                            token.source === 'raydium-direct' ? 'bg-green-100 text-green-800' :
-                                            token.source === 'birdeye' ? 'bg-blue-100 text-blue-800' :
-                                            token.source === 'dexscreener' ? 'bg-yellow-100 text-yellow-800' :
-                                            'bg-gray-100 text-gray-800'
+                                            trade.side === 'BUY' 
+                                                ? 'bg-green-100 text-green-800' 
+                                                : 'bg-red-100 text-red-800'
                                         }`}>
-                                            {token.source || 'unknown'}
+                                            {trade.side}
                                         </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                        {formatNumber(trade.sol_amount)}
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap">
+                                        <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                                            trade.status === 'completed' ? 'bg-green-100 text-green-800' :
+                                            trade.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                            'bg-red-100 text-red-800'
+                                        }`}>
+                                            {trade.status}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                        {trade.profit_loss !== null 
+                                            ? formatPercentage(trade.profit_loss / trade.sol_amount * 100)
+                                            : '-'
+                                        }
                                     </td>
                                 </tr>
                             ))}
@@ -439,106 +396,114 @@ const Dashboard = () => {
                 </div>
             )}
 
-            
-            {activeTab === 'pumpfun' && (
-                <div className="space-y-6">
+            {activeTab === 'influencers' && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {/* Tracked Influencers */}
                     <div className="bg-white rounded-lg shadow p-6">
-                        <h3 className="text-lg font-semibold mb-4">Pump.fun Scanner Status</h3>
-                        <div className="grid grid-cols-3 gap-4">
-                            <div className="text-center">
-                                <div className="text-2xl font-bold text-purple-600">
-                                    {scannerStats.pump_fun?.tokensFound || 0}
+                        <h3 className="text-lg font-semibold mb-4">Tracked Influencers</h3>
+                        <div className="space-y-3">
+                            {influencers.tracked_influencers.map((inf) => (
+                                <div key={inf.handle} className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                                    <div>
+                                        <div className="font-medium">@{inf.handle}</div>
+                                        <div className="text-sm text-gray-600">
+                                            {inf.platform} • Tier {inf.tier}
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="text-sm font-medium">Weight: {inf.weight}</div>
+                                        <div className="text-xs text-gray-500">
+                                            Min followers: {inf.minFollowers.toLocaleString()}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div className="text-sm text-gray-600">Tokens Found</div>
-                            </div>
-                            <div className="text-center">
-                                <div className="text-2xl font-bold text-green-600">
-                                    {scannerStats.pump_fun?.isRunning ? 'Active' : 'Inactive'}
-                                </div>
-                                <div className="text-sm text-gray-600">Scanner Status</div>
-                            </div>
-                            <div className="text-center">
-                                <div className="text-2xl font-bold text-blue-600">
-                                    {scannerStats.pump_fun?.recentTokensCount || 0}
-                                </div>
-                                <div className="text-sm text-gray-600">Recent Tokens</div>
-                            </div>
+                            ))}
                         </div>
                     </div>
 
-                    <div className="bg-white rounded-lg shadow overflow-hidden">
-                        <div className="px-6 py-4 border-b border-gray-200">
-                            <h3 className="text-lg font-semibold">Recent Pump.fun Tokens</h3>
+                    {/* Recent Influencer Calls */}
+                    <div className="bg-white rounded-lg shadow p-6">
+                        <h3 className="text-lg font-semibold mb-4">Recent Calls</h3>
+                        <div className="space-y-3 max-h-96 overflow-y-auto">
+                            {influencers.recent_calls.map((call, index) => (
+                                <div key={index} className="p-3 bg-gray-50 rounded">
+                                    <div className="flex justify-between items-start mb-2">
+                                        <div className="font-medium">@{call.influencer}</div>
+                                        <div className="text-xs text-gray-500">
+                                            {new Date(call.timestamp).toLocaleTimeString()}
+                                        </div>
+                                    </div>
+                                    <div className="text-sm text-gray-700">
+                                        Tokens: {call.tokens.join(', ')}
+                                    </div>
+                                    <div className="flex justify-between text-xs text-gray-600 mt-1">
+                                        <span>Sentiment: {formatNumber(call.sentiment)}</span>
+                                        <span>Strength: {formatNumber(call.signal_strength)}</span>
+                                    </div>
+                                </div>
+                            ))}
                         </div>
-                        <table className="min-w-full divide-y divide-gray-200">
-                            <thead className="bg-gray-50">
-                                <tr>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Token</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Age</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Liquidity</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Market Cap</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Risk Score</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                                </tr>
-                            </thead>
-                            <tbody className="bg-white divide-y divide-gray-200">
-                                {pumpFunTokens.map((token) => (
-                                    <tr key={token.address} className="hover:bg-gray-50">
-                                        <td className="px-6 py-4 whitespace-nowrap">
-                                            <div>
-                                                <div className="text-sm font-medium text-gray-900">
-                                                    {token.symbol}
-                                                </div>
-                                                <div className="text-xs text-gray-500">
-                                                    {token.address.substring(0, 8)}...
-                                                </div>
-                                            </div>
-                                        </td>
-                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                            <span className={\`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full \${getTokenAgeMinutes(token.discovered_at) < 5 ? 'bg-red-100 text-red-800' : getTokenAgeMinutes(token.discovered_at) < 30 ? 'bg-orange-100 text-orange-800' : 'bg-gray-100 text-gray-800'}\`}>
-                                                {getTokenAge(token.discovered_at)}
-                                            </span>
-                                        </td>
-                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                            ${formatNumber(token.liquidity || 0, 0)}
-                                        </td>
-                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                            ${formatNumber(token.market_cap || 0, 0)}
-                                        </td>
-                                        <td className="px-6 py-4 whitespace-nowrap">
-                                            <div className="flex items-center">
-                                                <div className="w-24 bg-gray-200 rounded-full h-2 mr-2">
-                                                    <div 
-                                                        className={\`h-2 rounded-full \${token.risk_score < 50 ? 'bg-green-500' : token.risk_score < 70 ? 'bg-yellow-500' : 'bg-red-500'}\`}
-                                                        style={{ width: \`\${token.risk_score}%\` }}
-                                                    />
-                                                </div>
-                                                <span className="text-sm text-gray-500">
-                                                    {formatNumber(token.risk_score || 0, 1)}
-                                                </span>
-                                            </div>
-                                        </td>
-                                        <td className="px-6 py-4 whitespace-nowrap">
-                                            <span className="px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-purple-100 text-purple-800">
-                                                Pump.fun
-                                            </span>
-                                        </td>
-                                    </tr>
-                                ))}
-                                {pumpFunTokens.length === 0 && (
-                                    <tr>
-                                        <td colSpan="6" className="px-6 py-4 text-center text-gray-500">
-                                            No pump.fun tokens detected yet. Make sure pump.fun monitoring is enabled.
-                                        </td>
-                                    </tr>
-                                )}
-                            </tbody>
-                        </table>
                     </div>
                 </div>
             )}
 
-{/* Continue with other tabs... */}
+            {activeTab === 'performance' && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {/* Performance Summary */}
+                    <div className="bg-white rounded-lg shadow p-6">
+                        <h3 className="text-lg font-semibold mb-4">7-Day Performance</h3>
+                        <div className="space-y-4">
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">Total Trades</span>
+                                <span className="font-medium">{performance.summary.total_trades}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">Win Rate</span>
+                                <span className="font-medium">
+                                    {formatPercentage((performance.summary.win_rate || 0) * 100)}
+                                </span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">Total P&L</span>
+                                <span className="font-medium">
+                                    {formatNumber(performance.summary.total_pnl || 0)} SOL
+                                </span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">Avg Daily P&L</span>
+                                <span className="font-medium">
+                                    {formatNumber(performance.summary.avg_daily_pnl || 0)} SOL
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Active Positions */}
+                    <div className="bg-white rounded-lg shadow p-6">
+                        <h3 className="text-lg font-semibold mb-4">Active Positions</h3>
+                        <div className="space-y-3 max-h-64 overflow-y-auto">
+                            {portfolio.positions.map((position) => (
+                                <div key={position.token_address} className="flex justify-between items-center p-3 bg-gray-50 rounded">
+                                    <div>
+                                        <div className="font-medium">{position.symbol}</div>
+                                        <div className="text-sm text-gray-600">
+                                            {formatNumber(position.balance)} tokens
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="font-medium">
+                                            {formatNumber(position.total_invested)} SOL
+                                        </div>
+                                        <div className="text-sm">
+                                            {formatPercentage(position.pnl || 0)}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
