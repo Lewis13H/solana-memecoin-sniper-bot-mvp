@@ -71,6 +71,8 @@ class MemecoinTradingBot {
                     trading: this.components.trading.isTrading
                 },
                 features: {
+                    pumpFunMonitoring: process.env.ENABLE_PUMPFUN_MONITORING === 'true',
+                    enhancedWebsockets: process.env.ENHANCED_WEBSOCKETS === 'true',
                     multiSourceScanning: true,
                     sources: Object.keys(this.components.scanner.scannerConfigs || {}),
                     raydiumMonitoring: !!process.env.HELIUS_API_KEY,
@@ -312,7 +314,98 @@ class MemecoinTradingBot {
             
             if (this.components.scanner.scannerConfigs[source]) {
                 this.components.scanner.scannerConfigs[source].enabled = enabled;
-                res.json({ message: `Scanner ${source} ${enabled ? 'enabled' : 'disabled'}` });
+                res.json({ message: `Scanner ${source}
+// Get pump.fun specific tokens
+this.app.get('/api/tokens/pumpfun', (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 20;
+        const tokens = this.db.getPumpFunTokens(limit);
+        const enrichedTokens = tokens.map(token => ({
+            ...token,
+            metadata: token.metadata ? JSON.parse(token.metadata) : {},
+            is_pump_fun: token.is_pump_fun === 1
+        }));
+        res.json(enrichedTokens);
+    } catch (error) {
+        logger.error('Error fetching pump.fun tokens:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get tokens by source
+this.app.get('/api/tokens/source/:source', (req, res) => {
+    try {
+        const source = req.params.source;
+        const limit = parseInt(req.query.limit) || 20;
+        const tokens = this.db.getTokensBySource(source, limit);
+        res.json(tokens);
+    } catch (error) {
+        logger.error('Error fetching tokens by source:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get scanner statistics
+this.app.get('/api/scanners/stats', (req, res) => {
+    try {
+        const stats = {
+            enhanced_scanner: {
+                isScanning: this.components.scanner.isScanning,
+                processedTokens: this.components.scanner.processedTokens.size,
+                processedPools: this.components.scanner.processedPools.size
+            },
+            pump_fun: this.components.scanner.pumpFunScanner ? 
+                this.components.scanner.pumpFunScanner.getStats() : 
+                { enabled: false },
+            sources: {
+                dexscreener: { enabled: true },
+                birdeye: { enabled: !!process.env.BIRDEYE_API_KEY },
+                raydium: { enabled: true },
+                pumpfun: { enabled: process.env.ENABLE_PUMPFUN_MONITORING === 'true' }
+            }
+        };
+        res.json(stats);
+    } catch (error) {
+        logger.error('Error fetching scanner stats:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Real-time pump.fun tokens (last 5 minutes)
+this.app.get('/api/tokens/pumpfun/realtime', async (req, res) => {
+    try {
+        if (!this.components.scanner.pumpFunScanner) return res.json([]);
+        const realtimeTokens = await this.components.scanner.pumpFunScanner.getRecentTokens(10);
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        const ultraFresh = realtimeTokens.filter(token => token.createdAt > fiveMinutesAgo);
+        res.json(ultraFresh);
+    } catch (error) {
+        logger.error('Error fetching realtime pump.fun tokens:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Toggle pump.fun monitoring
+this.app.post('/api/features/pumpfun/toggle', async (req, res) => {
+    try {
+        const { enabled } = req.body;
+        if (enabled && !this.components.scanner.pumpFunScanner) {
+            await this.components.scanner.startPumpFunMonitoring();
+            res.json({ message: 'Pump.fun monitoring enabled' });
+        } else if (!enabled && this.components.scanner.pumpFunScanner) {
+            await this.components.scanner.pumpFunScanner.stop();
+            res.json({ message: 'Pump.fun monitoring disabled' });
+        } else {
+            res.json({ message: 'No change needed' });
+        }
+    } catch (error) {
+        logger.error('Error toggling pump.fun monitoring:', error);
+        res.status(500).json({ error: 'Failed to toggle pump.fun monitoring' });
+    }
+});
+
+
+ ${enabled ? 'enabled' : 'disabled'}` });
             } else {
                 res.status(400).json({ error: 'Invalid scanner source' });
             }
